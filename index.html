@@ -46,6 +46,7 @@ h2{font-size:17px;margin:18px 0 8px}
 .alert{border-left:5px solid var(--red)}
 .alert.soon{border-left-color:var(--org)}
 .empty{text-align:center;color:var(--mut);padding:40px 10px}
+.alarm{border:2px solid var(--red)}
 .note{font-size:13px;color:var(--mut);background:var(--card);border:1px dashed var(--bd);border-radius:10px;padding:10px;margin-top:14px}
 </style>
 </head>
@@ -162,6 +163,12 @@ function renderList(){
   for(const v of vs) for(const i of dueItems(v)) if(i.st==="red"||i.st==="org") alerts.push({v,i});
   alerts.sort((a,b) => (a.i.st==="red"?0:1)-(b.i.st==="red"?0:1));
   let h = "";
+  if(alerts.length && !ackedToday()){
+    h += `<div class="card alarm"><b>Alarm: Es ist etwas fällig.</b>
+      <div class="mut">Der Ton läuft nur, solange die App offen ist. Auf dem iPhone musst du einmal auf den Bildschirm tippen, damit der Ton starten darf.</div>
+      <div class="row" style="margin-top:8px"><button class="btn sm" onclick="playSound(snd().type)">Ton abspielen</button>
+      <button class="btn sm sec" onclick="ackNow()">Für heute quittieren</button></div></div>`;
+  }
   if(alerts.length){
     h += `<h2>Achtung (${alerts.length})</h2>`;
     h += alerts.map(({v,i}) => `<div class="card alert ${i.st==="org"?"soon":""} click" onclick="openVehicle('${v.id}')">
@@ -361,6 +368,9 @@ function download(name, text, type){
 document.getElementById("menuBtn").onclick = () => modal(`<h2 style="margin-top:0">Menü</h2>
   <div class="row" style="flex-direction:column;align-items:stretch;gap:10px">
   <button class="btn" onclick="askNotif()">Benachrichtigungen erlauben</button>
+  <div><label>Alarm-Ton</label><select id="m_type" onchange="setSnd()">${[["klingel","Klingelton"],["sirene","Sirene"],["melodie","Melodie"],["aus","Aus (kein Ton)"]].map(([k,n]) => `<option value="${k}" ${(snd().on?snd().type:"aus")===k?"selected":""}>${n}</option>`).join("")}</select>
+  <label>Lautstärke</label><input id="m_vol" type="range" min="10" max="100" value="${Math.round(snd().vol*100)}" onchange="setSnd()">
+  <button class="btn sec" style="width:100%;margin-top:8px" onclick="setSnd();playSound(snd().type)">Ton testen</button></div>
   <button class="btn sec" onclick="exportBackup()">Backup exportieren (JSON)</button>
   <label class="btn sec" style="text-align:center;margin:0;cursor:pointer">Backup importieren<input type="file" accept="application/json" style="display:none" onchange="importBackup(event)"></label>
   <button class="btn sec" onclick="closeModal()">Schließen</button></div>
@@ -398,17 +408,72 @@ async function notifyDue(){
       if(i.st!=="red" && i.st!=="org") continue;
       const k = i.key+i.st; if(sent[k]===t) continue;
       const title = `${i.st==="red"?"Überfällig":"Bald fällig"}: ${i.label} – ${v.plate}`;
-      if(reg) await reg.showNotification(title, {body:i.text, icon:"icon-192.png", tag:k}); else new Notification(title, {body:i.text, icon:"icon-192.png"});
+      if(reg) await reg.showNotification(title, {body:i.text, icon:"icon-192.png", tag:k, vibrate:[300,150,300,150,300]}); else new Notification(title, {body:i.text, icon:"icon-192.png"});
       sent[k] = t;
     }
     localStorage.setItem("fahrzeuge.notified", JSON.stringify(sent));
   }catch(e){}
 }
 
+/* ---------- Alarm-Ton (wird im Browser erzeugt, keine Datei nötig) ---------- */
+let actx = null, pendingAlarm = false;
+const snd = () => Object.assign({on:true, type:"klingel", vol:0.8}, state.settings.sound || {});
+const ackKey = "fahrzeuge.ack";
+function ackedToday(){ try{ return localStorage.getItem(ackKey)===iso(today()); }catch(e){ return false; } }
+function ackNow(){ try{ localStorage.setItem(ackKey, iso(today())); }catch(e){} pendingAlarm=false; render(); }
+function hasAlarm(){ return state.vehicles.some(v => dueItems(v).some(i => i.st==="red" || i.st==="org")); }
+function audio(){
+  const AC = window.AudioContext || window.webkitAudioContext;
+  if(!AC) return null;
+  if(!actx) actx = new AC();
+  return actx;
+}
+function tone(c, t0, f, dur, type, vol, f2){
+  const o = c.createOscillator(), g = c.createGain();
+  o.type = type; o.frequency.setValueAtTime(f, t0);
+  if(f2) o.frequency.linearRampToValueAtTime(f2, t0+dur);
+  g.gain.setValueAtTime(0.0001, t0);
+  g.gain.exponentialRampToValueAtTime(vol, t0+0.015);
+  g.gain.exponentialRampToValueAtTime(0.0001, t0+dur);
+  o.connect(g); g.connect(c.destination); o.start(t0); o.stop(t0+dur+0.05);
+}
+function playSound(type){
+  const c = audio();
+  if(!c) return false;
+  if(c.state==="suspended") c.resume();
+  const v = Math.max(0.1, Math.min(1, snd().vol)) * 0.5, t = c.currentTime + 0.05;
+  if(type==="sirene"){
+    for(let r=0;r<3;r++){ tone(c, t+r*1.2, 600, 0.6, "sawtooth", v, 1000); tone(c, t+r*1.2+0.6, 1000, 0.6, "sawtooth", v, 600); }
+  } else if(type==="melodie"){
+    const n = [523,659,784,1047,784,659,523];
+    for(let r=0;r<2;r++) n.forEach((f,i) => tone(c, t+r*2.4+i*0.3, f, 0.32, "triangle", v));
+  } else {
+    for(let r=0;r<4;r++) for(let k=0;k<6;k++) tone(c, t+r*1.3+k*0.1, k%2?1100:1400, 0.08, "square", v*0.5);
+  }
+  return true;
+}
+function setSnd(){
+  const t = document.getElementById("m_type").value, vol = Number(document.getElementById("m_vol").value)/100;
+  state.settings.sound = {on:t!=="aus", type:t==="aus"?snd().type:t, vol};
+  save();
+}
+function tryAlarm(){
+  if(!snd().on || !hasAlarm() || ackedToday()) return;
+  const c = audio();
+  if(c && c.state==="running"){ playSound(snd().type); pendingAlarm=false; } else { pendingAlarm=true; }
+}
+/* Browser erlauben Ton erst nach einer Berührung: beim ersten Tippen wird ein wartender Alarm abgespielt */
+document.addEventListener("pointerdown", () => {
+  const c = audio();
+  if(c && c.state!=="running") c.resume().then(() => { if(pendingAlarm){ pendingAlarm=false; tryAlarm(); } }).catch(()=>{});
+}, true);
+setInterval(() => { if(!document.hidden){ render(); tryAlarm(); } }, 5*60*1000);
+
 /* ---------- Start ---------- */
 render();
 if("serviceWorker" in navigator) navigator.serviceWorker.register("sw.js").then(notifyDue).catch(()=>{});
-document.addEventListener("visibilitychange", () => { if(!document.hidden){ render(); notifyDue(); } });
+document.addEventListener("visibilitychange", () => { if(!document.hidden){ render(); notifyDue(); tryAlarm(); } });
+tryAlarm();
 try{ navigator.storage && navigator.storage.persist && navigator.storage.persist(); }catch(e){}
 </script>
 </body>
